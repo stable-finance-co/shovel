@@ -455,11 +455,38 @@ func TestFilter(t *testing.T) {
 			"bar",
 			true,
 		},
+		{
+			Filter{Op: "eq", Arg: []string{""}},
+			[]byte{0x00, 0x01, 0x02},
+			false,
+		},
 	}
 	for _, c := range cases {
 		frs := filterResults{}
 		err := c.f.Accept(context.Background(), mt, pg, c.d, &frs)
 		tc.NoErr(t, err)
+		tc.WantGot(t, c.want, frs.accept())
+	}
+}
+
+func TestFilterResults(t *testing.T) {
+	cases := []struct {
+		kind  string
+		want  bool
+		input []bool
+	}{
+		{"and", false, []bool{true, false}},
+		{"and", false, []bool{false, false}},
+		{"and", true, []bool{true, true}},
+		{"or", true, []bool{true, false}},
+		{"or", true, []bool{true, true}},
+		{"or", false, []bool{false, false}},
+	}
+	for _, c := range cases {
+		frs := filterResults{kind: c.kind}
+		for _, b := range c.input {
+			frs.add(b)
+		}
 		tc.WantGot(t, c.want, frs.accept())
 	}
 }
