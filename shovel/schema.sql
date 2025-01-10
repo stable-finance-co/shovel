@@ -154,7 +154,6 @@ BEGIN;
 
 -- Create latest_blocks table in shovel schema
 CREATE TABLE IF NOT EXISTS shovel.latest_blocks (
-    chain_id INT NOT NULL,
     src_name TEXT NOT NULL,
     block_number NUMERIC NOT NULL,
     updated_at TIMESTAMPTZ DEFAULT NOW(),
@@ -168,9 +167,9 @@ CREATE INDEX IF NOT EXISTS idx_latest_blocks_src_name ON shovel.latest_blocks (s
 CREATE OR REPLACE FUNCTION shovel.update_latest_blocks()
 RETURNS TRIGGER AS $$
 BEGIN
-    INSERT INTO shovel.latest_blocks (chain_id, src_name, block_number)
-    VALUES (NEW.chain_id, NEW.src_name, NEW.num)
-    ON CONFLICT (chain_id, src_name)
+    INSERT INTO shovel.latest_blocks (src_name, block_number)
+    VALUES (NEW.src_name, NEW.num)
+    ON CONFLICT (src_name)
     DO UPDATE SET
         block_number = GREATEST(shovel.latest_blocks.block_number, EXCLUDED.block_number),
         updated_at = NOW();
