@@ -914,7 +914,7 @@ func (lwc *logWithCtx) get(name string) any {
 	case "tx_signer":
 		d, err := lwc.t.Signer()
 		if err != nil {
-			slog.ErrorContext(lwc.ctx, "unable to derive signer", err)
+			slog.ErrorContext(lwc.ctx, "unable to derive signer", "error", err)
 			return nil
 		}
 		return d
@@ -936,6 +936,8 @@ func (lwc *logWithCtx) get(name string) any {
 		return &lwc.t.GasPrice
 	case "tx_effective_gas_price":
 		return &lwc.t.EffectiveGasPrice
+	case "tx_contract_address":
+		return lwc.t.ContractAddress.Bytes()
 	case "tx_max_priority_fee_per_gas":
 		return &lwc.t.MaxPriorityFeePerGas
 	case "tx_max_fee_per_gas":
