@@ -1,15 +1,36 @@
 package dig
 
 import (
+	"context"
+	"database/sql"
 	"encoding/hex"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 
-	"github.com/indexsupply/x/bint"
+	"blake.io/pqx/pqxtest"
+	"github.com/holiman/uint256"
+	"github.com/indexsupply/shovel/bint"
+	"github.com/indexsupply/shovel/eth"
+	"github.com/indexsupply/shovel/tc"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/jackc/pgx/v5/stdlib"
 
 	"kr.dev/diff"
 )
+
+func TestMain(m *testing.M) {
+	sql.Register("postgres", stdlib.GetDefaultDriver())
+	pqxtest.TestMain(m)
+}
+
+func testpg(t *testing.T) *pgxpool.Pool {
+	pqxtest.CreateDB(t, "")
+	pg, err := pgxpool.New(context.Background(), pqxtest.DSNForTest(t))
+	tc.NoErr(t, err)
+	return pg
+}
 
 func TestHasStatic(t *testing.T) {
 	cases := []struct {
@@ -316,6 +337,24 @@ func TestDBType(t *testing.T) {
 			false,
 			reflect.Bool,
 		},
+		{
+			"bool",
+			hb("0000000000000000000000000000000000000000000000000000000000000001"),
+			true,
+			reflect.Bool,
+		},
+		{
+			"int256",
+			hb("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"),
+			&negInt{uint256.NewInt(0).Neg(uint256.NewInt(1))},
+			reflect.Ptr,
+		},
+		{
+			"bytes",
+			nil,
+			[]byte{},
+			reflect.Slice,
+		},
 	}
 	for _, tc := range cases {
 		got := dbtype(tc.abitype, tc.input)
@@ -367,4 +406,87 @@ func TestNumIndexed(t *testing.T) {
 		},
 	}
 	diff.Test(t, t.Errorf, 3, event.numIndexed())
+}
+
+func TestFilter(t *testing.T) {
+	dec2uint256 := func(s string) *uint256.Int {
+		i, _ := uint256.FromDecimal(s)
+		return i
+	}
+	pg := testpg(t)
+	mt := new(sync.Mutex)
+	cases := []struct {
+		f    Filter
+		d    any
+		want bool
+	}{
+		{
+			Filter{Op: "gt", Arg: []string{"1"}},
+			eth.Uint64(0),
+			false,
+		},
+		{
+			Filter{Op: "gt", Arg: []string{"1"}},
+			eth.Uint64(2),
+			true,
+		},
+		{
+			Filter{Op: "eq", Arg: []string{"340282366920938463463374607431768211456"}},
+			dec2uint256("340282366920938463463374607431768211456"),
+			true,
+		},
+		{
+			Filter{Op: "eq", Arg: []string{"foo"}},
+			"foo",
+			true,
+		},
+		{
+			Filter{Op: "ne", Arg: []string{"bar"}},
+			"foo",
+			true,
+		},
+		{
+			Filter{Op: "contains", Arg: []string{"foo", "bar"}},
+			"baz",
+			false,
+		},
+		{
+			Filter{Op: "contains", Arg: []string{"foo", "bar"}},
+			"bar",
+			true,
+		},
+		{
+			Filter{Op: "eq", Arg: []string{""}},
+			[]byte{0x00, 0x01, 0x02},
+			false,
+		},
+	}
+	for _, c := range cases {
+		frs := filterResults{}
+		err := c.f.Accept(context.Background(), mt, pg, c.d, &frs)
+		tc.NoErr(t, err)
+		tc.WantGot(t, c.want, frs.accept())
+	}
+}
+
+func TestFilterResults(t *testing.T) {
+	cases := []struct {
+		kind  string
+		want  bool
+		input []bool
+	}{
+		{"and", false, []bool{true, false}},
+		{"and", false, []bool{false, false}},
+		{"and", true, []bool{true, true}},
+		{"or", true, []bool{true, false}},
+		{"or", true, []bool{true, true}},
+		{"or", false, []bool{false, false}},
+	}
+	for _, c := range cases {
+		frs := filterResults{kind: c.kind}
+		for _, b := range c.input {
+			frs.add(b)
+		}
+		tc.WantGot(t, c.want, frs.accept())
+	}
 }

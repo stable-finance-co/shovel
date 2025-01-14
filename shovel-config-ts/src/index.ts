@@ -24,12 +24,22 @@ export type Column = {
   type: PGColumnType;
 };
 
+/**
+ * An IndexStatement is an array of strings. Each
+ * string reprsents a column name and may be followed
+ * by ASC or DESC to specify the index sort order.
+ */
+export type IndexStatment = string[];
+
 export type Table = {
   name: string;
   columns: Column[];
+  index?: IndexStatment[];
 };
 
-export type FilterOp = "contains" | "!contains";
+export type FilterRefOp = "contains" | "!contains";
+
+export type FilterArgOp = FilterRefOp | "eq" | "ne" | "gt" | "lt";
 
 export type FilterReference = {
   integration: string;
@@ -37,8 +47,8 @@ export type FilterReference = {
 };
 
 export type Filter = {
-  op: FilterOp;
-  arg: Hex[];
+  op: FilterRefOp;
+  arg: string[];
 };
 
 export type BlockDataOptions =
@@ -57,28 +67,66 @@ export type BlockDataOptions =
   | "tx_type"
   | "tx_status"
   | "log_idx"
-  | "log_addr";
+  | "tx_gas_used"
+  | "tx_gas_price"
+  | "tx_effective_gas_price"
+  | "tx_contract_address"
+  | "tx_max_priority_fee_per_gas"
+  | "tx_max_fee_per_gas"
+  | "tx_nonce"
+  | "log_addr"
+  | "trace_action_call_type"
+  | "trace_action_idx"
+  | "trace_action_from"
+  | "trace_action_to"
+  | "trace_action_value";
 
+/**
+ * BlockData represents non-event data to index. Shovel can index
+ * block, receipt, transaction, and log data in addition to abi
+ * decoded event log data.
+ */
 export type BlockData = {
   name: BlockDataOptions;
 
   column: string;
-  filter_op?: FilterOp;
-  filter_arg?: Hex[];
+} & ({
+  filter_op?: FilterArgOp;
+  filter_arg?: string[];
+} | {
+  filter_op?: FilterRefOp;
   filter_ref?: FilterReference;
-};
+});
 
+/**
+ * EventInput is a superset of the ABI JSON defintion for event
+ * inputs. The additions to the standard are column, filter_op,
+ * filter_arg, and filter_ref.
+ *
+ * These additions are instruction for Shovel so that it can map the
+ * event data to your PG table.
+ *
+ * If column is omitted, then the event input field will not be saved.
+ */
 export type EventInput = {
   readonly indexed?: boolean;
   readonly name: string;
   readonly type: string;
+  /**
+   * internalType is not used by shovel
+   * but is specified for easy copy/paste.
+   */
+  readonly internalType?: string;
   readonly components?: EventInput[];
 
   column?: string;
-  filter_op?: FilterOp;
-  filter_arg?: Hex[];
+} & ({
+  filter_op?: FilterArgOp;
+  filter_arg?: string[];
+} | {
+  filter_op?: FilterRefOp;
   filter_ref?: FilterReference;
-};
+});
 
 export type Event = {
   readonly name: string;
@@ -87,11 +135,21 @@ export type Event = {
   readonly inputs: readonly EventInput[];
 };
 
+/**
+ * Source represents an Ethereum HTTP JSON RPC API Provider.
+ */
 export type Source = {
   name: string;
   url: string;
+  /**
+   * Shovel will round-robin requests to these urls.
+   * This may be helpful for reducing downtime.
+   *
+   * url is added to urls
+   */
+  urls: string[];
   chain_id: EnvRef | number;
-  poll_duration: EnvRef | string;
+  poll_duration?: EnvRef | string;
   concurrency?: EnvRef | number;
   batch_size?: EnvRef | number;
 };
@@ -101,13 +159,18 @@ export type SourceReference = {
   start: EnvRef | bigint;
 };
 
+export type Notification = {
+	columns: string[];
+};
+
 export type Integration = {
   name: string;
   enabled: boolean;
   sources: SourceReference[];
   table: Table;
-  block: BlockData[];
-  event: Event;
+  notification?: Notification;
+  block?: BlockData[];
+  event?: Event;
 };
 
 export type Dashboard = {

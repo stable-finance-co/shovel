@@ -1,7 +1,7 @@
 // eth_getLogs filter
 package glf
 
-import "fmt"
+import "strings"
 
 type Filter struct {
 	needs       []string
@@ -9,6 +9,7 @@ type Filter struct {
 	UseBlocks   bool
 	UseReceipts bool
 	UseLogs     bool
+	UseTraces   bool
 
 	addresses []string
 	topics    [][]string
@@ -23,6 +24,10 @@ func New(needs, addresses []string, topics [][]string) *Filter {
 	if any(needs, difference(log, block)) {
 		f.UseLogs = true
 		needs = difference(needs, log)
+	}
+	if any(needs, difference(trace, block)) {
+		f.UseTraces = true
+		needs = difference(needs, trace)
 	}
 	if any(needs, difference(block, header)) {
 		f.UseBlocks = true
@@ -41,15 +46,23 @@ func (f *Filter) Addresses() []string { return f.addresses }
 func (f *Filter) Topics() [][]string  { return f.topics }
 
 func (f *Filter) String() string {
-	return fmt.Sprintf(
-		"headers=%t blocks=%t receipts=%t logs=%t addrs=%d topics=%d",
-		f.UseHeaders,
-		f.UseBlocks,
-		f.UseReceipts,
-		f.UseLogs,
-		len(f.addresses),
-		len(f.topics),
-	)
+	var opts = make([]string, 0, 7)
+	if f.UseLogs {
+		opts = append(opts, "l")
+	}
+	if f.UseHeaders {
+		opts = append(opts, "h")
+	}
+	if f.UseBlocks {
+		opts = append(opts, "b")
+	}
+	if f.UseReceipts {
+		opts = append(opts, "r")
+	}
+	if f.UseTraces {
+		opts = append(opts, "t")
+	}
+	return strings.Join(opts, ",")
 }
 
 func any(a, b []string) bool {
@@ -100,6 +113,8 @@ var (
 		"tx_input",
 		"tx_value",
 		"tx_type",
+		"tx_max_priority_fee_per_gas",
+		"tx_max_fee_per_gas",
 	}
 	receipt = []string{
 		"block_hash",
@@ -122,5 +137,11 @@ var (
 		"tx_idx",
 		"log_addr",
 		"log_idx",
+	}
+	trace = []string{
+		"trace_action_call_type",
+		"trace_action_from",
+		"trace_action_to",
+		"trace_action_value",
 	}
 )

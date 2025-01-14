@@ -7,6 +7,7 @@ package dig
 import (
 	"bytes"
 	"context"
+	"database/sql/driver"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -15,11 +16,11 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/indexsupply/x/bint"
-	"github.com/indexsupply/x/eth"
-	"github.com/indexsupply/x/shovel/glf"
-	"github.com/indexsupply/x/wctx"
-	"github.com/indexsupply/x/wpg"
+	"github.com/indexsupply/shovel/bint"
+	"github.com/indexsupply/shovel/eth"
+	"github.com/indexsupply/shovel/shovel/glf"
+	"github.com/indexsupply/shovel/wctx"
+	"github.com/indexsupply/shovel/wpg"
 
 	"github.com/holiman/uint256"
 	"github.com/jackc/pgx/v5"
@@ -385,52 +386,108 @@ type Filter struct {
 	Ref Ref      `json:"filter_ref"`
 }
 
-func (f Filter) Accept(ctx context.Context, pgmut *sync.Mutex, pg wpg.Conn, d any) (bool, error) {
-	var val []byte
-	switch v := d.(type) {
-	case []byte:
-		val = []byte(v)
-	case eth.Bytes:
-		val = []byte(v)
-	default:
-		return true, nil
+func (f Filter) Accept(ctx context.Context, pgmut *sync.Mutex, pg wpg.Conn, d any, frs *filterResults) error {
+	if len(f.Arg) == 0 && len(f.Ref.Integration) == 0 {
+		return nil
 	}
 
-	switch {
-	case strings.HasSuffix(f.Op, "contains"):
+	switch v := d.(type) {
+	case eth.Bytes:
+		d = []byte(v)
+	case eth.Uint64:
+		d = uint64(v)
+	}
+	switch v := d.(type) {
+	case []byte:
 		var res bool
 		switch {
-		case len(f.Ref.Table) > 0:
-			q := fmt.Sprintf(
-				`select true from %s where %s = $1`,
-				f.Ref.Table,
-				f.Ref.Column,
-			)
-			pgmut.Lock()
-			defer pgmut.Unlock()
-			err := pg.QueryRow(ctx, q, val).Scan(&res)
+		case strings.HasSuffix(f.Op, "contains"):
 			switch {
-			case errors.Is(err, pgx.ErrNoRows):
-				res = false
-			case err != nil:
-				const tag = "filter using reference (%s %s): %w"
-				return false, fmt.Errorf(tag, f.Ref.Table, f.Ref.Column, err)
+			case len(f.Ref.Table) > 0:
+				q := fmt.Sprintf(
+					`select true from %s where %s = $1`,
+					f.Ref.Table,
+					f.Ref.Column,
+				)
+				pgmut.Lock()
+				defer pgmut.Unlock()
+				err := pg.QueryRow(ctx, q, v).Scan(&res)
+				switch {
+				case errors.Is(err, pgx.ErrNoRows):
+					res = false
+				case err != nil:
+					const tag = "filter using reference (%s %s): %w"
+					return fmt.Errorf(tag, f.Ref.Table, f.Ref.Column, err)
+				}
+			default:
+				for i := range f.Arg {
+					if bytes.Contains(v, eth.DecodeHex(f.Arg[i])) {
+						res = true
+						break
+					}
+				}
 			}
-		default:
+			if strings.HasPrefix(f.Op, "!") {
+				res = !res
+			}
+			frs.add(res)
+		case f.Op == "eq" || f.Op == "ne":
 			for i := range f.Arg {
-				if bytes.Contains(val, eth.DecodeHex(f.Arg[i])) {
+				if bytes.Equal(v, eth.DecodeHex(f.Arg[i])) {
 					res = true
 					break
 				}
 			}
+			if f.Op == "ne" {
+				res = !res
+			}
+		default:
+			res = true
 		}
-		if strings.HasPrefix(f.Op, "!") {
-			return !res, nil
+		frs.add(res)
+	case string:
+		switch f.Op {
+		case "contains":
+			frs.add(slices.Contains(f.Arg, v))
+		case "!contains":
+			frs.add(!slices.Contains(f.Arg, v))
+		case "eq":
+			frs.add(v == f.Arg[0])
+		case "ne":
+			frs.add(v != f.Arg[0])
 		}
-		return res, nil
-	default:
-		return true, nil
+	case uint64:
+		i, err := strconv.ParseUint(f.Arg[0], 10, 64)
+		if err != nil {
+			return fmt.Errorf("unable to convert filter arg to int: %q", f.Arg[0])
+		}
+		switch f.Op {
+		case "eq":
+			frs.add(v == i)
+		case "ne":
+			frs.add(v != i)
+		case "gt":
+			frs.add(v > i)
+		case "lt":
+			frs.add(v < i)
+		}
+	case *uint256.Int:
+		i := &uint256.Int{}
+		if err := i.SetFromDecimal(f.Arg[0]); err != nil {
+			return fmt.Errorf("unable to convert filter arg dec to uint256: %q", f.Arg[0])
+		}
+		switch f.Op {
+		case "eq":
+			frs.add(v.Cmp(i) == 0)
+		case "ne":
+			frs.add(v.Cmp(i) != 0)
+		case "gt":
+			frs.add(v.Cmp(i) == 1)
+		case "lt":
+			frs.add(v.Cmp(i) == -1)
+		}
 	}
+	return nil
 }
 
 func parseArray(elm atype, s string) atype {
@@ -603,20 +660,31 @@ type Integration struct {
 	Block        []BlockData
 	Table        wpg.Table
 	Notification Notification
+	filterAGG    string
 
 	Columns []string
 	coldefs []coldef
 
-	numIndexed    int
-	numSelected   int
-	numBDSelected int
-	numNotify     int
+	indexing         indexingOP
+	numIndexed       int
+	numSelected      int
+	numBDSelected    int
+	numTraceSelected int
+	numNotify        int
 
 	resultCache *Result
 	sighash     []byte
 }
 
-func New(name string, ev Event, bd []BlockData, table wpg.Table, notif Notification) (Integration, error) {
+type indexingOP byte
+
+const (
+	indexTx indexingOP = iota
+	indexTrace
+	indexLog
+)
+
+func New(name string, ev Event, bd []BlockData, table wpg.Table, notif Notification, filterAGG string) (Integration, error) {
 	ig := Integration{
 		name:         name,
 		Event:        ev,
@@ -624,13 +692,27 @@ func New(name string, ev Event, bd []BlockData, table wpg.Table, notif Notificat
 		Table:        table,
 		Notification: notif,
 
+		filterAGG:   strings.ToLower(filterAGG),
 		numNotify:   len(notif.Columns),
 		numIndexed:  ev.numIndexed(),
 		resultCache: NewResult(ev.ABIType()),
 		sighash:     ev.SignatureHash(),
 	}
 	ig.setCols()
+	ig.setIndexing()
 	return ig, nil
+}
+
+func (ig *Integration) setIndexing() {
+	if ig.numBDSelected > 0 {
+		ig.indexing = indexTx
+	}
+	if ig.numSelected > 0 {
+		ig.indexing = indexLog
+	}
+	if ig.numTraceSelected > 0 {
+		ig.indexing = indexTrace
+	}
 }
 
 func (ig *Integration) setCols() {
@@ -661,6 +743,9 @@ func (ig *Integration) setCols() {
 			Notify:    slices.Contains(ig.Notification.Columns, c.Name),
 		})
 		ig.numBDSelected++
+		if strings.HasPrefix(c.Name, "trace_") {
+			ig.numTraceSelected++
+		}
 	}
 }
 
@@ -710,18 +795,30 @@ func (ig Integration) Insert(ctx context.Context, pgmut *sync.Mutex, pg wpg.Conn
 		lwc.b = &blocks[bidx]
 		for tidx := range blocks[bidx].Txs {
 			lwc.t = &lwc.b.Txs[tidx]
-			rows, skip, err = ig.processTx(rows, lwc, pgmut, pg)
-			if err != nil {
-				return 0, fmt.Errorf("processing tx: %w", err)
-			}
-			if skip {
-				continue
-			}
-			for lidx := range blocks[bidx].Txs[tidx].Logs {
-				lwc.l = &lwc.t.Logs[lidx]
-				rows, err = ig.processLog(rows, lwc, pgmut, pg)
+			switch ig.indexing {
+			case indexTx:
+				rows, skip, err = ig.processTx(rows, lwc, pgmut, pg)
 				if err != nil {
-					return 0, fmt.Errorf("processing log: %w", err)
+					return 0, fmt.Errorf("processing tx: %w", err)
+				}
+				if skip {
+					continue
+				}
+			case indexTrace:
+				for taidx := range blocks[bidx].Txs[tidx].TraceActions {
+					lwc.ta = &lwc.t.TraceActions[taidx]
+					rows, _, err = ig.processTx(rows, lwc, pgmut, pg)
+					if err != nil {
+						return 0, fmt.Errorf("processing log: %w", err)
+					}
+				}
+			case indexLog:
+				for lidx := range blocks[bidx].Txs[tidx].Logs {
+					lwc.l = &lwc.t.Logs[lidx]
+					rows, err = ig.processLog(rows, lwc, pgmut, pg)
+					if err != nil {
+						return 0, fmt.Errorf("processing log: %w", err)
+					}
 				}
 			}
 		}
@@ -774,8 +871,10 @@ func (ig *Integration) notify(lwc *logWithCtx, pg wpg.Conn, rows [][]any) error 
 					payload = append(payload, v)
 				case []byte:
 					payload = append(payload, eth.EncodeHex(v))
+				case *uint256.Int:
+					payload = append(payload, v.Dec())
 				default:
-					panic(v)
+					return fmt.Errorf("unknown type for notification: %T", rows[i][k])
 				}
 			}
 		}
@@ -791,6 +890,7 @@ type logWithCtx struct {
 	b   *eth.Block
 	t   *eth.Tx
 	l   *eth.Log
+	ta  *eth.TraceAction
 }
 
 func (lwc *logWithCtx) get(name string) any {
@@ -814,14 +914,14 @@ func (lwc *logWithCtx) get(name string) any {
 	case "tx_signer":
 		d, err := lwc.t.Signer()
 		if err != nil {
-			slog.ErrorContext(lwc.ctx, "unable to derive signer", err)
+			slog.ErrorContext(lwc.ctx, "unable to derive signer", "error", err)
 			return nil
 		}
 		return d
 	case "tx_to":
 		return lwc.t.To.Bytes()
 	case "tx_value":
-		return lwc.t.Value.Dec()
+		return &lwc.t.Value
 	case "tx_input":
 		return lwc.t.Data.Bytes()
 	case "tx_type":
@@ -830,11 +930,62 @@ func (lwc *logWithCtx) get(name string) any {
 		return lwc.t.Receipt.Status
 	case "log_idx":
 		return lwc.l.Idx
+	case "tx_gas_used":
+		return lwc.t.GasUsed
+	case "tx_gas_price":
+		return &lwc.t.GasPrice
+	case "tx_effective_gas_price":
+		return &lwc.t.EffectiveGasPrice
+	case "tx_contract_address":
+		return lwc.t.ContractAddress.Bytes()
+	case "tx_max_priority_fee_per_gas":
+		return &lwc.t.MaxPriorityFeePerGas
+	case "tx_max_fee_per_gas":
+		return &lwc.t.MaxFeePerGas
+	case "tx_nonce":
+		return lwc.t.Nonce
 	case "log_addr":
 		return lwc.l.Address.Bytes()
+	case "trace_action_call_type":
+		return lwc.ta.CallType
+	case "trace_action_idx":
+		return lwc.ta.Idx
+	case "trace_action_from":
+		return lwc.ta.From.Bytes()
+	case "trace_action_to":
+		return lwc.ta.To.Bytes()
+	case "trace_action_value":
+		return &lwc.ta.Value
 	default:
 		return nil
 	}
+}
+
+type filterResults struct {
+	kind string
+	set  bool
+	val  bool
+}
+
+func (fr *filterResults) add(b bool) {
+	if !fr.set {
+		fr.set = true
+		fr.val = b
+		return
+	}
+	switch fr.kind {
+	case "and":
+		fr.val = fr.val && b
+	default:
+		fr.val = fr.val || b
+	}
+}
+
+func (fr *filterResults) accept() bool {
+	if !fr.set {
+		return true
+	}
+	return fr.val
 }
 
 func (ig Integration) processTx(rows [][]any, lwc *logWithCtx, pgmut *sync.Mutex, pg wpg.Conn) ([][]any, bool, error) {
@@ -842,24 +993,23 @@ func (ig Integration) processTx(rows [][]any, lwc *logWithCtx, pgmut *sync.Mutex
 	case ig.numSelected > 0:
 		return rows, false, nil
 	case ig.numBDSelected > 0:
+		frs := filterResults{kind: ig.filterAGG}
 		row := make([]any, len(ig.coldefs))
 		for i, def := range ig.coldefs {
 			switch {
 			case !def.BlockData.Empty():
 				d := lwc.get(def.BlockData.Name)
-				accept, err := def.BlockData.Accept(lwc.ctx, pgmut, pg, d)
-				if err != nil {
+				if err := def.BlockData.Accept(lwc.ctx, pgmut, pg, d, &frs); err != nil {
 					return nil, false, fmt.Errorf("checking filter: %w", err)
-				}
-				if !accept {
-					return rows, true, nil
 				}
 				row[i] = d
 			default:
 				return rows, false, fmt.Errorf("expected only blockdata coldef")
 			}
 		}
-		rows = append(rows, row)
+		if frs.accept() {
+			rows = append(rows, row)
+		}
 	}
 	return rows, true, nil
 }
@@ -877,19 +1027,16 @@ func (ig Integration) processLog(rows [][]any, lwc *logWithCtx, pgmut *sync.Mute
 		}
 		for i := 0; i < ig.resultCache.Len(); i++ {
 			ictr, actr := 1, 0
+			frs := filterResults{kind: ig.filterAGG}
 			row := make([]any, len(ig.coldefs))
 			for j, def := range ig.coldefs {
 				switch {
 				case def.Input.Indexed:
-					d := lwc.l.Topics[ictr]
-					accept, err := def.Input.Accept(lwc.ctx, pgmut, pg, d)
-					if err != nil {
+					d := dbtype(def.Input.Type, lwc.l.Topics[ictr])
+					if err := def.Input.Accept(lwc.ctx, pgmut, pg, d, &frs); err != nil {
 						return nil, fmt.Errorf("checking filter: %w", err)
 					}
-					if !accept {
-						return rows, nil
-					}
-					row[j] = dbtype(def.Input.Type, d)
+					row[j] = d
 					ictr++
 				case !def.BlockData.Empty():
 					var d any
@@ -898,80 +1045,93 @@ func (ig Integration) processLog(rows [][]any, lwc *logWithCtx, pgmut *sync.Mute
 						d = i
 					default:
 						d = lwc.get(def.BlockData.Name)
-						accept, err := def.BlockData.Accept(lwc.ctx, pgmut, pg, d)
-						if err != nil {
+						if err := def.BlockData.Accept(lwc.ctx, pgmut, pg, d, &frs); err != nil {
 							return nil, fmt.Errorf("checking filter: %w", err)
-						}
-						if !accept {
-							return rows, nil
 						}
 					}
 					row[j] = d
 				default:
-					d := ig.resultCache.At(i)[actr]
-					accept, err := def.Input.Accept(lwc.ctx, pgmut, pg, d)
-					if err != nil {
+					d := dbtype(def.Input.Type, ig.resultCache.At(i)[actr])
+					if err := def.Input.Accept(lwc.ctx, pgmut, pg, d, &frs); err != nil {
 						return nil, fmt.Errorf("checking filter: %w", err)
 					}
-					if !accept {
-						return rows, nil
-					}
-					row[j] = dbtype(def.Input.Type, d)
+					row[j] = d
 					actr++
 				}
 			}
-			rows = append(rows, row)
+			if frs.accept() {
+				rows = append(rows, row)
+			}
 		}
 	default:
+		frs := filterResults{kind: ig.filterAGG}
 		row := make([]any, len(ig.coldefs))
 		for i, def := range ig.coldefs {
 			switch {
 			case def.Input.Indexed:
 				d := dbtype(def.Input.Type, lwc.l.Topics[1+i])
-				accept, err := def.Input.Accept(lwc.ctx, pgmut, pg, d)
-				if err != nil {
+				if err := def.Input.Accept(lwc.ctx, pgmut, pg, d, &frs); err != nil {
 					return nil, fmt.Errorf("checking filter: %w", err)
-				}
-				if !accept {
-					return rows, nil
 				}
 				row[i] = d
 			case !def.BlockData.Empty():
 				d := lwc.get(def.BlockData.Name)
-				accept, err := def.BlockData.Accept(lwc.ctx, pgmut, pg, d)
-				if err != nil {
+				if err := def.BlockData.Accept(lwc.ctx, pgmut, pg, d, &frs); err != nil {
 					return nil, fmt.Errorf("checking filter: %w", err)
-				}
-				if !accept {
-					return rows, nil
 				}
 				row[i] = d
 			default:
 				return nil, fmt.Errorf("no rows for un-indexed data")
 			}
 		}
-		rows = append(rows, row)
+		if frs.accept() {
+			rows = append(rows, row)
+		}
 	}
 	return rows, nil
 }
 
+type negInt struct {
+	i *uint256.Int
+}
+
+func (ni *negInt) Value() (driver.Value, error) {
+	v, err := ni.i.Value()
+	if ni.i.Sign() < 0 {
+		x := uint256.NewInt(0).Neg(ni.i)
+		v, err = x.Value()
+		return "-" + v.(string), err
+	}
+	return v, err
+}
+
 func dbtype(abitype string, d []byte) any {
 	switch {
-	case strings.HasPrefix(abitype, "uint"), strings.HasPrefix(abitype, "int"):
+	case strings.HasPrefix(abitype, "int"):
+		x := &uint256.Int{}
+		x.SetBytes(d)
+		return &negInt{x}
+	case strings.HasPrefix(abitype, "uint"):
 		var x uint256.Int
 		x.SetBytes(d)
-		return x.Dec()
-	case abitype == "address":
+		return &x
+	case strings.HasPrefix(abitype, "address"):
 		if len(d) == 32 {
 			return d[12:]
 		}
 		return d
 	case abitype == "bool":
-		var x uint256.Int
-		x.SetBytes32(d)
-		return x.Dec() == "1"
+		if len(d) == 32 {
+			return d[31] == 0x01
+		}
+		return false
 	case abitype == "string":
 		return string(d)
+	case abitype == "bytes":
+		if len(d) == 0 {
+			return []byte{}
+		}
+		return d
 	default:
 		return d
 	}

@@ -6,12 +6,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"slices"
+	"strings"
 	"time"
 
-	"github.com/indexsupply/x/dig"
-	"github.com/indexsupply/x/wos"
-	"github.com/indexsupply/x/wpg"
-	"github.com/indexsupply/x/wstrings"
+	"github.com/indexsupply/shovel/dig"
+	"github.com/indexsupply/shovel/wos"
+	"github.com/indexsupply/shovel/wpg"
+	"github.com/indexsupply/shovel/wstrings"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -78,6 +79,12 @@ func ValidateFix(conf *Root) error {
 		return fmt.Errorf("checking config for filter_refs: %w", err)
 	}
 	for i := range conf.Integrations {
+		if conf.Integrations[i].FilterAGG == "" {
+			conf.Integrations[i].FilterAGG = "or"
+		}
+		if !slices.Contains([]string{"and", "or", ""}, conf.Integrations[i].FilterAGG) {
+			return fmt.Errorf("filter_agg must be one of: and, or. got: %s", conf.Integrations[i].FilterAGG)
+		}
 		conf.Integrations[i].AddRequiredFields()
 		AddUniqueIndex(&conf.Integrations[i].Table)
 		if err := ValidateColRefs(conf.Integrations[i]); err != nil {
@@ -262,6 +269,7 @@ func AddUniqueIndex(table *wpg.Table) {
 		"tx_idx",
 		"log_idx",
 		"abi_idx",
+		"trace_action_idx",
 	}
 	var uidx []string
 	for i := range possible {
@@ -326,7 +334,7 @@ type Dashboard struct {
 type Source struct {
 	Name         string
 	ChainID      uint64
-	URL          string
+	URLs         []string
 	WSURL        string
 	Start        uint64
 	Stop         uint64
@@ -337,27 +345,40 @@ type Source struct {
 
 func (s *Source) UnmarshalJSON(d []byte) error {
 	x := struct {
-		Name         wos.EnvString `json:"name"`
-		ChainID      wos.EnvUint64 `json:"chain_id"`
-		URL          wos.EnvString `json:"url"`
-		WSURL        wos.EnvString `json:"ws_url"`
-		Start        wos.EnvUint64 `json:"start"`
-		Stop         wos.EnvUint64 `json:"stop"`
-		PollDuration wos.EnvString `json:"poll_duration"`
-		Concurrency  wos.EnvInt    `json:"concurrency"`
-		BatchSize    wos.EnvInt    `json:"batch_size"`
+		Name         wos.EnvString   `json:"name"`
+		ChainID      wos.EnvUint64   `json:"chain_id"`
+		URL          wos.EnvString   `json:"url"`
+		URLs         []wos.EnvString `json:"urls"`
+		WSURL        wos.EnvString   `json:"ws_url"`
+		Start        wos.EnvUint64   `json:"start"`
+		Stop         wos.EnvUint64   `json:"stop"`
+		PollDuration wos.EnvString   `json:"poll_duration"`
+		Concurrency  wos.EnvInt      `json:"concurrency"`
+		BatchSize    wos.EnvInt      `json:"batch_size"`
 	}{}
 	if err := json.Unmarshal(d, &x); err != nil {
 		return err
 	}
 	s.Name = string(x.Name)
 	s.ChainID = uint64(x.ChainID)
-	s.URL = string(x.URL)
 	s.WSURL = string(x.WSURL)
 	s.Start = uint64(x.Start)
 	s.Stop = uint64(x.Stop)
 	s.Concurrency = int(x.Concurrency)
 	s.BatchSize = int(x.BatchSize)
+
+	var urls []string
+	urls = append(urls, string(x.URL))
+	for _, url := range x.URLs {
+		urls = append(urls, string(url))
+	}
+
+	for _, u := range urls {
+		if len(u) == 0 {
+			continue
+		}
+		s.URLs = append(s.URLs, u)
+	}
 
 	s.PollDuration = time.Second
 	if len(x.PollDuration) > 0 {
@@ -380,10 +401,14 @@ func Sources(ctx context.Context, pgp *pgxpool.Pool) ([]Source, error) {
 		return nil, fmt.Errorf("querying sources: %w", err)
 	}
 	for rows.Next() {
-		var s Source
-		if err := rows.Scan(&s.Name, &s.ChainID, &s.URL); err != nil {
+		var (
+			s      Source
+			urlStr string
+		)
+		if err := rows.Scan(&s.Name, &s.ChainID, &urlStr); err != nil {
 			return nil, fmt.Errorf("scanning source: %w", err)
 		}
+		s.URLs = append(s.URLs, urlStr)
 		res = append(res, s)
 	}
 	return res, nil
@@ -399,6 +424,7 @@ type Integration struct {
 	Enabled      bool             `json:"enabled"`
 	Sources      []Source         `json:"sources"`
 	Table        wpg.Table        `json:"table"`
+	FilterAGG    string           `json:"filter_agg"`
 	Notification dig.Notification `json:"notification"`
 	Compiled     Compiled         `json:"compiled"`
 	Block        []dig.BlockData  `json:"block"`
@@ -444,6 +470,11 @@ func (ig *Integration) AddRequiredFields() {
 	for _, inp := range ig.Event.Selected() {
 		if !inp.Indexed {
 			add("abi_idx", "int2")
+		}
+	}
+	for _, bd := range ig.Block {
+		if strings.HasPrefix(bd.Name, "trace_") {
+			add("trace_action_idx", "int2")
 		}
 	}
 }

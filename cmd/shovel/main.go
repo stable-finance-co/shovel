@@ -16,13 +16,13 @@ import (
 	"strings"
 	"time"
 
-	"github.com/indexsupply/x/shovel"
-	"github.com/indexsupply/x/shovel/config"
-	"github.com/indexsupply/x/shovel/web"
-	"github.com/indexsupply/x/wctx"
-	"github.com/indexsupply/x/wos"
-	"github.com/indexsupply/x/wpg"
-	"github.com/indexsupply/x/wslog"
+	"github.com/indexsupply/shovel/shovel"
+	"github.com/indexsupply/shovel/shovel/config"
+	"github.com/indexsupply/shovel/shovel/web"
+	"github.com/indexsupply/shovel/wctx"
+	"github.com/indexsupply/shovel/wos"
+	"github.com/indexsupply/shovel/wpg"
+	"github.com/indexsupply/shovel/wslog"
 )
 
 func check(err error) {
@@ -71,14 +71,34 @@ func main() {
 
 	lh := wslog.New(os.Stdout, &slog.HandlerOptions{Level: logLevel})
 	lh.RegisterContext(func(ctx context.Context) (string, any) {
-		id := wctx.ChainID(ctx)
-		if id < 1 {
+		igName := wctx.IGName(ctx)
+		if igName == "" {
 			return "", nil
 		}
-		return "chain", fmt.Sprintf("%.5d", id)
+		return "ig", igName
+	})
+	lh.RegisterContext(func(ctx context.Context) (string, any) {
+		srcHost := wctx.SrcHost(ctx)
+		if srcHost == "" {
+			return "", nil
+		}
+		return "host", srcHost
+	})
+	lh.RegisterContext(func(ctx context.Context) (string, any) {
+		srcName := wctx.SrcName(ctx)
+		if srcName == "" {
+			return "", nil
+		}
+		return "src", srcName
+	})
+	lh.RegisterContext(func(ctx context.Context) (string, any) {
+		num, limit := wctx.NumLimit(ctx)
+		if num == 0 || limit == 0 {
+			return "", nil
+		}
+		return "req", fmt.Sprintf("%d/%d", num, limit)
 	})
 	slog.SetDefault(slog.New(lh.WithAttrs([]slog.Attr{
-		slog.Int("p", os.Getpid()),
 		slog.String("v", Commit),
 	})))
 
@@ -137,6 +157,7 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", wh.Index)
 	mux.HandleFunc("/diag", wh.Diag)
+	mux.HandleFunc("/metrics", wh.Prom)
 	mux.HandleFunc("/login", wh.Login)
 	mux.Handle("/task-updates", wh.Authn(wh.Updates))
 	mux.Handle("/add-source", wh.Authn(wh.AddSource))

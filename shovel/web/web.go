@@ -14,13 +14,14 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
-	"github.com/indexsupply/x/jrpc2"
-	"github.com/indexsupply/x/shovel"
-	"github.com/indexsupply/x/shovel/config"
-	"github.com/indexsupply/x/wstrings"
+	"github.com/indexsupply/shovel/jrpc2"
+	"github.com/indexsupply/shovel/shovel"
+	"github.com/indexsupply/shovel/shovel/config"
+	"github.com/indexsupply/shovel/wstrings"
 
 	"filippo.io/age"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -64,6 +65,10 @@ type Handler struct {
 
 	sess     session.Config
 	password []byte
+
+	// global rate limit for diag requests
+	diagLastReqMut sync.Mutex
+	diagLastReq    time.Time
 }
 
 func New(mgr *shovel.Manager, conf *config.Root, pgp *pgxpool.Pool) *Handler {
@@ -122,7 +127,7 @@ func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if err := tmpl.Execute(w, nil); err != nil {
-			slog.ErrorContext(r.Context(), "error", err)
+			slog.ErrorContext(r.Context(), "template", "error", err)
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
@@ -169,7 +174,99 @@ type DiagResult struct {
 	PGError   string `json:"pg_error"`
 }
 
+func (h *Handler) Prom(w http.ResponseWriter, r *http.Request) {
+	h.diagLastReqMut.Lock()
+	if time.Since(h.diagLastReq) < time.Second {
+		h.diagLastReqMut.Unlock()
+		slog.InfoContext(r.Context(), "rate limiting metrics")
+		fmt.Fprintf(w, "too many diag requests")
+		return
+	}
+	h.diagLastReq = time.Now()
+	h.diagLastReqMut.Unlock()
+
+	checkSource := func(srcName string, src shovel.Source) []string {
+		var (
+			res                 []string
+			start               = time.Now()
+			srcLatest, pgLatest uint64
+			pgErr, srcErr       int
+		)
+		// PG
+		const q = `
+			select num
+			from shovel.task_updates
+			where src_name = $1
+			order by num desc
+			limit 1
+		`
+		err := h.pgp.QueryRow(r.Context(), q, srcName).Scan(&pgLatest)
+		if err != nil {
+			pgErr++
+		}
+		res = append(res, "# HELP shovel_latest_block_local last block processed")
+		res = append(res, "# TYPE shovel_latest_block_local gauge")
+		res = append(res, fmt.Sprintf(`shovel_latest_block_local{src="%s"} %d`, srcName, pgLatest))
+
+		res = append(res, "# HELP shovel_pg_ping number of ms to make basic status query")
+		res = append(res, "# TYPE shovel_pg_ping gauge")
+		res = append(res, fmt.Sprintf(`shovel_pg_ping %d`, uint64(time.Since(start)/time.Millisecond)))
+
+		res = append(res, "# HELP shovel_pg_ping_error number of errors in making basic status query")
+		res = append(res, "# TYPE shovel_pg_ping_error gauge")
+		res = append(res, fmt.Sprintf(`shovel_pg_ping_error %d`, pgErr))
+
+		// Source
+		start = time.Now()
+		srcLatest, _, err = src.Latest(r.Context(), src.NextURL().String(), 0)
+		if err != nil {
+			srcErr++
+		}
+		res = append(res, "# HELP shovel_latest_block_remote latest block height from rpc api")
+		res = append(res, "# TYPE shovel_latest_block_remote gauge")
+		res = append(res, fmt.Sprintf(`shovel_latest_block_remote{src="%s"} %d`, srcName, srcLatest))
+
+		res = append(res, "# HELP shovel_rpc_ping number of ms to make a basic http request to rpc api")
+		res = append(res, "# TYPE shovel_rpc_ping gauge")
+		res = append(res, fmt.Sprintf(`shovel_rpc_ping{src="%s"} %d`, srcName, uint64(time.Since(start)/time.Millisecond)))
+
+		res = append(res, "# HELP shovel_rpc_ping_error number of errors in making basic rpc api request")
+		res = append(res, "# TYPE shovel_rpc_ping_error gauge")
+		res = append(res, fmt.Sprintf(`shovel_rpc_ping_error{src="%s"} %d`, srcName, srcErr))
+
+		// Delta
+		res = append(res, "# HELP shovel_delta number of blocks between the source and the shovel database")
+		res = append(res, "# TYPE shovel_delta gauge")
+		res = append(res, fmt.Sprintf(`shovel_delta{src="%s"} %d`, srcName, srcLatest-pgLatest))
+		return res
+	}
+
+	scs, err := h.conf.AllSources(r.Context(), h.pgp)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	var res []string
+	for _, sc := range scs {
+		src := jrpc2.New(sc.URLs...)
+		for _, line := range checkSource(sc.Name, src) {
+			res = append(res, line)
+		}
+	}
+	fmt.Fprintf(w, strings.Join(res, "\n"))
+}
+
 func (h *Handler) Diag(w http.ResponseWriter, r *http.Request) {
+	h.diagLastReqMut.Lock()
+	if time.Since(h.diagLastReq) < time.Second {
+		h.diagLastReqMut.Unlock()
+		slog.InfoContext(r.Context(), "rate limiting metrics")
+		fmt.Fprintf(w, "too many diag requests")
+		return
+	}
+	h.diagLastReq = time.Now()
+	h.diagLastReqMut.Unlock()
+
 	var (
 		res []DiagResult
 		ctx = r.Context()
@@ -191,7 +288,7 @@ func (h *Handler) Diag(w http.ResponseWriter, r *http.Request) {
 	}
 	checkSrc := func(src shovel.Source, dr *DiagResult) {
 		start := time.Now()
-		n, _, err := src.Latest(ctx, 0)
+		n, _, err := src.Latest(ctx, src.NextURL().String(), 0)
 		if err != nil {
 			dr.Error = err.Error()
 		}
@@ -206,7 +303,7 @@ func (h *Handler) Diag(w http.ResponseWriter, r *http.Request) {
 	for _, sc := range scs {
 		var (
 			dr  = &DiagResult{Source: sc.Name}
-			src = jrpc2.New(sc.URL)
+			src = jrpc2.New(sc.URLs...)
 		)
 		checkPG(dr)
 		checkSrc(src, dr)
@@ -269,7 +366,7 @@ func (h *Handler) SaveIntegration(w http.ResponseWriter, r *http.Request) {
 	defer r.Body.Close()
 	err = json.NewDecoder(r.Body).Decode(&ig)
 	if err != nil {
-		slog.ErrorContext(ctx, "decoding integration", err)
+		slog.ErrorContext(ctx, "decoding integration", "error", err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -280,19 +377,19 @@ func (h *Handler) SaveIntegration(w http.ResponseWriter, r *http.Request) {
 	}
 	cj, err := json.Marshal(ig)
 	if err != nil {
-		slog.ErrorContext(ctx, "encoding integration", err)
+		slog.ErrorContext(ctx, "encoding integration", "error", err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	const q = `insert into shovel.integrations(name, conf) values ($1, $2)`
 	_, err = h.pgp.Exec(ctx, q, ig.Name, cj)
 	if err != nil {
-		slog.ErrorContext(ctx, "inserting integration", err)
+		slog.ErrorContext(ctx, "inserting integration", "error", err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	if err := h.mgr.Restart(); err != nil {
-		slog.ErrorContext(ctx, "saving integration", err)
+		slog.ErrorContext(ctx, "saving integration", "error", err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -325,7 +422,7 @@ func (h *Handler) AddIntegration(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := tmpl.Execute(w, view); err != nil {
-		slog.ErrorContext(ctx, "error", err)
+		slog.ErrorContext(ctx, "template", "error", err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -423,12 +520,12 @@ func (h *Handler) SaveSource(w http.ResponseWriter, r *http.Request) {
 	)
 	chainID, err := strconv.Atoi(r.FormValue("chainID"))
 	if err != nil {
-		slog.ErrorContext(ctx, "parsing chain id", err)
+		slog.ErrorContext(ctx, "parsing chain id", "error", err)
 		return
 	}
 	name := r.FormValue("name")
 	if len(name) == 0 {
-		slog.ErrorContext(ctx, "parsing chain name", err)
+		slog.ErrorContext(ctx, "parsing chain name", "error", err)
 		return
 	}
 	if err := wstrings.Safe(name); err != nil {
@@ -437,7 +534,7 @@ func (h *Handler) SaveSource(w http.ResponseWriter, r *http.Request) {
 	}
 	url := r.FormValue("ethURL")
 	if len(url) == 0 {
-		slog.ErrorContext(ctx, "parsing chain eth url", err)
+		slog.ErrorContext(ctx, "parsing chain eth url", "error", err)
 		return
 	}
 	const q = `
@@ -447,11 +544,11 @@ func (h *Handler) SaveSource(w http.ResponseWriter, r *http.Request) {
 	_, err = h.pgp.Exec(ctx, q, chainID, name, url)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
-		slog.ErrorContext(ctx, "inserting task", err)
+		slog.ErrorContext(ctx, "inserting task", "error", err)
 		return
 	}
 	if err := h.mgr.Restart(); err != nil {
-		slog.ErrorContext(ctx, "saving source", err)
+		slog.ErrorContext(ctx, "saving source", "error", err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}

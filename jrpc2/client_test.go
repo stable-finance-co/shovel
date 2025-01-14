@@ -3,6 +3,7 @@ package jrpc2
 import (
 	"context"
 	_ "embed"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -10,14 +11,15 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"slices"
 	"sort"
-	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/indexsupply/x/eth"
-	"github.com/indexsupply/x/shovel/glf"
+	"github.com/indexsupply/shovel/eth"
+	"github.com/indexsupply/shovel/shovel/glf"
+	"github.com/indexsupply/shovel/tc"
 	"golang.org/x/sync/errgroup"
 	"kr.dev/diff"
 )
@@ -31,7 +33,7 @@ type testGetter struct {
 	callCount int
 }
 
-func (tg *testGetter) get(ctx context.Context, start, limit uint64) ([]eth.Block, error) {
+func (tg *testGetter) get(ctx context.Context, url string, start, limit uint64) ([]eth.Block, error) {
 	tg.callCount++
 
 	var res []eth.Block
@@ -44,15 +46,15 @@ func (tg *testGetter) get(ctx context.Context, start, limit uint64) ([]eth.Block
 func TestCache_Prune(t *testing.T) {
 	ctx := context.Background()
 	tg := testGetter{}
-	c := cache{}
-	blocks, err := c.get(false, ctx, 1, 1, tg.get)
+	c := cache{maxreads: 2}
+	blocks, err := c.get(false, ctx, "", 1, 1, tg.get)
 	diff.Test(t, t.Fatalf, nil, err)
 	diff.Test(t, t.Errorf, 1, len(blocks))
 	diff.Test(t, t.Errorf, 1, tg.callCount)
 	diff.Test(t, t.Errorf, 1, len(c.segments))
 
 	for i := uint64(0); i < 9; i++ {
-		blocks, err := c.get(false, ctx, 2+i, 1, tg.get)
+		blocks, err := c.get(false, ctx, "", 2+i, 1, tg.get)
 		diff.Test(t, t.Fatalf, nil, err)
 		diff.Test(t, t.Errorf, 1, len(blocks))
 	}
@@ -76,6 +78,25 @@ func TestCache_Prune(t *testing.T) {
 	})
 }
 
+func TestCache_MaxReads(t *testing.T) {
+	var (
+		ctx = context.Background()
+		tg  = testGetter{}
+		c   = cache{maxreads: 2}
+	)
+	_, err := c.get(false, ctx, "", 1, 1, tg.get)
+	tc.NoErr(t, err)
+	tc.WantGot(t, 1, tg.callCount)
+
+	_, err = c.get(false, ctx, "", 1, 1, tg.get)
+	tc.NoErr(t, err)
+	tc.WantGot(t, 1, tg.callCount)
+
+	_, err = c.get(false, ctx, "", 1, 1, tg.get)
+	tc.NoErr(t, err)
+	tc.WantGot(t, 2, tg.callCount)
+}
+
 var (
 	//go:embed testdata/block-18000000.json
 	block18000000JSON string
@@ -88,13 +109,32 @@ var (
 	logs1000001JSON string
 )
 
+func methodsMatch(t *testing.T, body []byte, want ...string) bool {
+	var req []request
+
+	if err := json.Unmarshal(body, &req); err != nil {
+		var r request
+		if err := json.Unmarshal(body, &r); err != nil {
+			t.Fatal("unable to decode json into a request or []request")
+		}
+		req = append(req, r)
+	}
+
+	var methods []string
+	for i := range req {
+		methods = append(methods, req[i].Method)
+	}
+	t.Logf("methods=%#v", methods)
+	return slices.Equal(methods, want)
+}
+
 func TestLatest_Cached(t *testing.T) {
 	var counter int
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, err := io.ReadAll(r.Body)
 		diff.Test(t, t.Fatalf, nil, err)
 		switch {
-		case strings.Contains(string(body), "eth_getBlockByNumber"):
+		case methodsMatch(t, body, "eth_getBlockByNumber"):
 			switch counter {
 			case 0:
 				_, err := w.Write([]byte(`{"result": {
@@ -116,18 +156,18 @@ func TestLatest_Cached(t *testing.T) {
 	ctx := context.Background()
 	c := New(ts.URL).WithMaxReads(1)
 
-	n, h, err := c.Latest(ctx, 0)
+	n, h, err := c.Latest(ctx, c.NextURL().String(), 0)
 	diff.Test(t, t.Errorf, nil, err)
 	diff.Test(t, t.Errorf, counter, 1)
 	diff.Test(t, t.Errorf, n, uint64(18000000))
 	diff.Test(t, t.Errorf, eth.EncodeHex(h), "0x95b198e154acbfc64109dfd22d8224fe927fd8dfdedfae01587674482ba4baf3")
 
-	n, _, err = c.Latest(ctx, 18000000-1)
+	n, _, err = c.Latest(ctx, c.NextURL().String(), 18000000-1)
 	diff.Test(t, t.Errorf, nil, err)
 	diff.Test(t, t.Errorf, counter, 1)
 	diff.Test(t, t.Errorf, n, uint64(18000000))
 
-	n, h, err = c.Latest(ctx, 18000000)
+	n, h, err = c.Latest(ctx, c.NextURL().String(), 18000000)
 	diff.Test(t, t.Errorf, nil, err)
 	diff.Test(t, t.Errorf, counter, 2)
 	diff.Test(t, t.Errorf, n, uint64(18000001))
@@ -195,7 +235,7 @@ func TestValidate_Blocks(t *testing.T) {
 		body, err := io.ReadAll(r.Body)
 		diff.Test(t, t.Fatalf, nil, err)
 		switch {
-		case strings.Contains(string(body), "eth_getBlockByNumber"):
+		case methodsMatch(t, body, "eth_getBlockByNumber", "eth_getBlockByNumber"):
 			_, err := w.Write([]byte(`[
 				{
 					"result": {
@@ -218,7 +258,7 @@ func TestValidate_Blocks(t *testing.T) {
 	var (
 		ctx    = context.Background()
 		c      = New(ts.URL)
-		_, err = c.Get(ctx, &glf.Filter{UseBlocks: true}, 18000000, 2)
+		_, err = c.Get(ctx, c.NextURL().String(), &glf.Filter{UseBlocks: true}, 18000000, 2)
 	)
 	want := "getting blocks: cache get: blocks: rpc response contains invalid data. requested last: 18000001 got: 18000002"
 	diff.Test(t, t.Fatalf, false, err == nil)
@@ -230,22 +270,32 @@ func TestValidate_Logs(t *testing.T) {
 		body, err := io.ReadAll(r.Body)
 		diff.Test(t, t.Fatalf, nil, err)
 		switch {
-		case strings.Contains(string(body), "eth_getLogs"):
-			_, err := w.Write([]byte(`{"result": [
-				{
-					"address": "0x0000000000000000000000000000000000000000",
-					"topics": [],
-					"blockHash": "0x95b198e154acbfc64109dfd22d8224fe927fd8dfdedfae01587674482ba4baf3",
-					"blockNumber": "0x112a880"
-				},
-				{
-					"address": "0x0000000000000000000000000000000000000000",
-					"topics": [],
-					"blockHash": "0xd5ca78be6c6b42cf929074f502cef676372c26f8d0ba389b6f9b5d612d70f815",
-					"blockNumber": "0x112a882",
-					"COMMENT": "off by one. should be 0x112a881"
+		case methodsMatch(t, body, "eth_getBlockByNumber", "eth_getLogs"):
+			_, err := w.Write([]byte(`[
+			{
+				"result": {
+					"hash": "0x95b198e154acbfc64109dfd22d8224fe927fd8dfdedfae01587674482ba4baf3",
+					"number": "0x112a880"
 				}
-			]}`))
+			},
+			{
+				"result": [
+					{
+						"address": "0x0000000000000000000000000000000000000000",
+						"topics": [],
+						"blockHash": "0x95b198e154acbfc64109dfd22d8224fe927fd8dfdedfae01587674482ba4baf3",
+						"blockNumber": "0x112a880"
+					},
+					{
+						"address": "0x0000000000000000000000000000000000000000",
+						"topics": [],
+						"blockHash": "0xd5ca78be6c6b42cf929074f502cef676372c26f8d0ba389b6f9b5d612d70f815",
+						"blockNumber": "0x112a882",
+						"COMMENT": "off by one. should be 0x112a881"
+					}
+				]
+			}
+			]`))
 			diff.Test(t, t.Fatalf, nil, err)
 		}
 	}))
@@ -253,11 +303,32 @@ func TestValidate_Logs(t *testing.T) {
 	var (
 		ctx    = context.Background()
 		c      = New(ts.URL)
-		_, err = c.Get(ctx, &glf.Filter{UseLogs: true}, 18000000, 2)
+		_, err = c.Get(ctx, c.NextURL().String(), &glf.Filter{UseLogs: true}, 18000000, 2)
 	)
-	want := "getting logs: block not found"
-	diff.Test(t, t.Fatalf, false, err == nil)
-	diff.Test(t, t.Fatalf, want, err.Error())
+	tc.WantErr(t, err)
+	want := "getting logs: eth_getLogs out of range block. num=18000002 start=18000000 lim=2"
+	tc.WantGot(t, want, err.Error())
+}
+
+func TestValidate_Logs_NoBlocks(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		diff.Test(t, t.Fatalf, nil, err)
+		switch {
+		case methodsMatch(t, body, "eth_getBlockByNumber", "eth_getLogs"):
+			_, err := w.Write([]byte(`[{"result": null},{"result": []}]`))
+			diff.Test(t, t.Fatalf, nil, err)
+		}
+	}))
+	defer ts.Close()
+	var (
+		ctx    = context.Background()
+		c      = New(ts.URL)
+		_, err = c.Get(ctx, c.NextURL().String(), &glf.Filter{UseLogs: true}, 18000000, 2)
+	)
+	tc.WantErr(t, err)
+	const want = "getting logs: eth backend missing logs for block: 18000001"
+	tc.WantGot(t, want, err.Error())
 }
 
 func TestError(t *testing.T) {
@@ -265,7 +336,7 @@ func TestError(t *testing.T) {
 		body, err := io.ReadAll(r.Body)
 		diff.Test(t, t.Fatalf, nil, err)
 		switch {
-		case strings.Contains(string(body), "eth_getBlockByNumber"):
+		case methodsMatch(t, body, "eth_getBlockByNumber"):
 			_, err := w.Write([]byte(`
 				[{
 					"jsonrpc": "2.0",
@@ -282,7 +353,7 @@ func TestError(t *testing.T) {
 		ctx    = context.Background()
 		c      = New(ts.URL)
 		want   = "getting blocks: cache get: rpc=eth_getBlockByNumber code=-32012 msg=credits"
-		_, got = c.Get(ctx, &glf.Filter{UseBlocks: true}, 1000001, 1)
+		_, got = c.Get(ctx, c.NextURL().String(), &glf.Filter{UseBlocks: true}, 1000001, 1)
 	)
 	diff.Test(t, t.Errorf, want, got.Error())
 }
@@ -290,7 +361,7 @@ func TestError(t *testing.T) {
 func TestGet(t *testing.T) {
 	ctx := context.Background()
 	const start, limit = 10, 5
-	blocks, err := New("").Get(ctx, &glf.Filter{}, start, limit)
+	blocks, err := New("").Get(ctx, "", &glf.Filter{}, start, limit)
 	diff.Test(t, t.Fatalf, nil, err)
 	diff.Test(t, t.Fatalf, len(blocks), limit)
 	diff.Test(t, t.Fatalf, blocks[0].Num(), uint64(10))
@@ -317,11 +388,11 @@ func TestGet_Cached(t *testing.T) {
 		body, err := io.ReadAll(r.Body)
 		diff.Test(t, t.Fatalf, nil, err)
 		switch {
-		case strings.Contains(string(body), "eth_getBlockByNumber"):
+		case methodsMatch(t, body, "eth_getBlockByNumber"):
 			atomic.AddUint64(&reqCount, 1)
 			_, err := w.Write([]byte(block18000000JSON))
 			diff.Test(t, t.Fatalf, nil, err)
-		case strings.Contains(string(body), "eth_getLogs"):
+		case methodsMatch(t, body, "eth_getBlockByNumber", "eth_getLogs"):
 			for ; reqCount == 0; time.Sleep(time.Second) {
 			}
 			_, err := w.Write([]byte(logs18000000JSON))
@@ -332,21 +403,24 @@ func TestGet_Cached(t *testing.T) {
 	var (
 		ctx    = context.Background()
 		c      = New(ts.URL)
-		findTx = func(b eth.Block, idx uint64) (eth.Tx, error) {
+		findTx = func(b *eth.Block, idx uint64) (*eth.Tx, error) {
 			for i := range b.Txs {
 				if b.Txs[i].Idx == eth.Uint64(idx) {
-					return b.Txs[i], nil
+					return &b.Txs[i], nil
 				}
 			}
-			return eth.Tx{}, fmt.Errorf("no tx at idx %d", idx)
+			return nil, fmt.Errorf("no tx at idx %d", idx)
 		}
 		getcall = func() error {
-			blocks, err := c.Get(ctx, &glf.Filter{UseHeaders: true, UseLogs: true}, 18000000, 1)
+			blocks, err := c.Get(ctx, c.NextURL().String(), &glf.Filter{UseHeaders: true, UseLogs: true}, 18000000, 1)
 			diff.Test(t, t.Errorf, nil, err)
+
+			blocks[0].Lock()
 			diff.Test(t, t.Errorf, len(blocks[0].Txs), 65)
-			tx, err := findTx(blocks[0], 0)
+			tx, err := findTx(&blocks[0], 0)
 			diff.Test(t, t.Errorf, nil, err)
 			diff.Test(t, t.Errorf, len(tx.Logs), 1)
+			blocks[0].Unlock()
 			return nil
 		}
 	)
@@ -356,15 +430,48 @@ func TestGet_Cached(t *testing.T) {
 	eg.Wait()
 }
 
+// Test that a block cache removes its segments after
+// they've been read N times. Once N is reached, subsequent
+// calls to Get should make new requests.
+func TestGet_Cached_Pruned(t *testing.T) {
+	var n int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		diff.Test(t, t.Fatalf, nil, err)
+		switch {
+		case methodsMatch(t, body, "eth_getBlockByNumber"):
+			atomic.AddInt32(&n, 1)
+			_, err := w.Write([]byte(block18000000JSON))
+			diff.Test(t, t.Fatalf, nil, err)
+		}
+	}))
+	defer ts.Close()
+	var (
+		ctx = context.Background()
+		c   = New(ts.URL).WithMaxReads(2)
+	)
+	_, err := c.Get(ctx, c.NextURL().String(), &glf.Filter{UseHeaders: true}, 18000000, 1)
+	diff.Test(t, t.Errorf, nil, err)
+	diff.Test(t, t.Errorf, n, int32(1))
+	_, err = c.Get(ctx, c.NextURL().String(), &glf.Filter{UseHeaders: true}, 18000000, 1)
+	diff.Test(t, t.Errorf, nil, err)
+	diff.Test(t, t.Errorf, n, int32(1))
+
+	//maxreads should have been reached with last 2 calls
+	_, err = c.Get(ctx, c.NextURL().String(), &glf.Filter{UseHeaders: true}, 18000000, 1)
+	diff.Test(t, t.Errorf, nil, err)
+	diff.Test(t, t.Errorf, n, int32(2))
+}
+
 func TestNoLogs(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, err := io.ReadAll(r.Body)
 		diff.Test(t, t.Fatalf, nil, err)
 		switch {
-		case strings.Contains(string(body), "eth_getBlockByNumber"):
+		case methodsMatch(t, body, "eth_getBlockByNumber"):
 			_, err := w.Write([]byte(block1000001JSON))
 			diff.Test(t, t.Fatalf, nil, err)
-		case strings.Contains(string(body), "eth_getLogs"):
+		case methodsMatch(t, body, "eth_getBlockByNumber", "eth_getLogs"):
 			_, err := w.Write([]byte(logs1000001JSON))
 			diff.Test(t, t.Fatalf, nil, err)
 		}
@@ -373,7 +480,7 @@ func TestNoLogs(t *testing.T) {
 
 	ctx := context.Background()
 	c := New(ts.URL)
-	blocks, err := c.Get(ctx, &glf.Filter{UseBlocks: true, UseLogs: true}, 1000001, 1)
+	blocks, err := c.Get(ctx, c.NextURL().String(), &glf.Filter{UseBlocks: true, UseLogs: true}, 1000001, 1)
 	diff.Test(t, t.Errorf, nil, err)
 
 	b := blocks[0]
@@ -388,10 +495,10 @@ func TestLatest(t *testing.T) {
 		body, err := io.ReadAll(r.Body)
 		diff.Test(t, t.Fatalf, nil, err)
 		switch {
-		case strings.Contains(string(body), "eth_getBlockByNumber"):
+		case methodsMatch(t, body, "eth_getBlockByNumber"):
 			_, err := w.Write([]byte(block18000000JSON))
 			diff.Test(t, t.Fatalf, nil, err)
-		case strings.Contains(string(body), "eth_getLogs"):
+		case methodsMatch(t, body, "eth_getBlockByNumber", "eth_getLogs"):
 			_, err := w.Write([]byte(logs18000000JSON))
 			diff.Test(t, t.Fatalf, nil, err)
 		}
@@ -400,7 +507,7 @@ func TestLatest(t *testing.T) {
 
 	ctx := context.Background()
 	c := New(ts.URL)
-	blocks, err := c.Get(ctx, &glf.Filter{UseBlocks: true, UseLogs: true}, 18000000, 1)
+	blocks, err := c.Get(ctx, c.NextURL().String(), &glf.Filter{UseBlocks: true, UseLogs: true}, 18000000, 1)
 	diff.Test(t, t.Errorf, nil, err)
 
 	b := blocks[0]

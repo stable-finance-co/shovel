@@ -4,23 +4,27 @@ package jrpc2
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode"
 
-	"github.com/indexsupply/x/eth"
-	"github.com/indexsupply/x/shovel/glf"
-	"github.com/indexsupply/x/wctx"
+	"github.com/holiman/uint256"
+	"github.com/indexsupply/shovel/eth"
+	"github.com/indexsupply/shovel/shovel/glf"
+	"github.com/indexsupply/shovel/wctx"
 
 	"github.com/goccy/go-json"
 	"github.com/klauspost/compress/gzhttp"
@@ -29,17 +33,56 @@ import (
 	"nhooyr.io/websocket/wsjson"
 )
 
-func New(url string) *Client {
+type URL struct {
+	parsed   *url.URL
+	provided string
+}
+
+func MustURL(provided string) *URL {
+	parsed, err := url.Parse(provided)
+	if err != nil {
+		fmt.Printf("unable to parse url: %s\n", provided)
+		os.Exit(1)
+	}
+	return &URL{parsed: parsed, provided: provided}
+}
+
+func (u *URL) Hostname() string {
+	return u.parsed.Hostname()
+}
+
+func (u *URL) String() string {
+	return u.parsed.String()
+}
+
+func randbytes() []byte {
+	b := make([]byte, 10)
+	rand.Read(b)
+	return b
+}
+
+func New(providedURLs ...string) *Client {
+	var (
+		urls           []*URL
+		debug, nocache bool
+	)
+	for _, provided := range providedURLs {
+		debug = strings.Contains(provided, "debug")
+		nocache = strings.Contains(provided, "nocache")
+		urls = append(urls, MustURL(provided))
+	}
 	return &Client{
-		d:       strings.Contains(url, "debug"),
-		nocache: strings.Contains(url, "nocache"),
+		d:       debug,
+		nocache: nocache,
 		hc: &http.Client{
 			Timeout:   10 * time.Second,
 			Transport: gzhttp.Transport(http.DefaultTransport),
 		},
+		urls:         urls,
 		pollDuration: time.Second,
-		url:          url,
 		lcache:       NumHash{maxreads: 20},
+		bcache:       cache{maxreads: 20},
+		hcache:       cache{maxreads: 20},
 	}
 }
 
@@ -47,9 +90,10 @@ type Client struct {
 	nocache bool
 	d       bool
 	hc      *http.Client
-	url     string
+	urls    []*URL
 	wsurl   string
 
+	reqCounter   uint64
 	pollDuration time.Duration
 
 	lcache NumHash
@@ -57,8 +101,16 @@ type Client struct {
 	hcache cache
 }
 
+func (c *Client) NextURL() *URL {
+	atomic.AddUint64(&c.reqCounter, 1)
+	next := c.reqCounter % uint64(len(c.urls))
+	return c.urls[next]
+}
+
 func (c *Client) WithMaxReads(n int) *Client {
 	c.lcache.maxreads = n
+	c.bcache.maxreads = n
+	c.hcache.maxreads = n
 	return c
 }
 
@@ -86,7 +138,7 @@ type request struct {
 	Params  []any  `json:"params"`
 }
 
-func (c *Client) do(ctx context.Context, dest, req any) error {
+func (c *Client) do(ctx context.Context, url string, dest, req any) error {
 	var (
 		eg   errgroup.Group
 		r, w = io.Pipe()
@@ -97,7 +149,7 @@ func (c *Client) do(ctx context.Context, dest, req any) error {
 		return json.NewEncoder(w).Encode(req)
 	})
 	eg.Go(func() error {
-		req, err := http.NewRequest("POST", c.url, c.debug(r))
+		req, err := http.NewRequest("POST", url, c.debug(r))
 		if err != nil {
 			return fmt.Errorf("unable to new request: %w", err)
 		}
@@ -171,16 +223,16 @@ func (nh *NumHash) update(n eth.Uint64, h []byte) {
 	nh.Hash.Write(h)
 }
 
-func (nh *NumHash) get(n uint64) (uint64, []byte, bool) {
+func (nh *NumHash) get(ctx context.Context, n uint64) (uint64, []byte, bool) {
 	nh.Lock()
 	defer nh.Unlock()
 
 	if err := nh.err; err != nil {
 		switch {
 		case errors.Is(err, net.ErrClosed), errors.Is(err, context.DeadlineExceeded):
-			slog.Debug("rpc connection reset")
+			slog.DebugContext(ctx, "rpc connection reset")
 		default:
-			slog.Debug("rpc connection error: %w", err)
+			slog.DebugContext(ctx, "rpc connection error", "error", err)
 		}
 		nh.err = nil
 		nh.once = sync.Once{}
@@ -188,12 +240,12 @@ func (nh *NumHash) get(n uint64) (uint64, []byte, bool) {
 	}
 
 	if n == 0 || uint64(nh.Num) < n {
-		slog.Debug("latest cache miss", "n", n, "latest", nh.Num)
+		slog.DebugContext(ctx, "latest cache miss", "n", n, "latest", nh.Num)
 		return 0, nil, false
 	}
 
 	if nh.nreads >= nh.maxreads {
-		slog.Debug("expiring latest cache",
+		slog.DebugContext(ctx, "expiring latest cache",
 			"n", n,
 			"latest", nh.Num,
 			"nreads", nh.nreads,
@@ -206,7 +258,7 @@ func (nh *NumHash) get(n uint64) (uint64, []byte, bool) {
 	}
 
 	nh.nreads++
-	slog.Debug("latest cache hit",
+	slog.DebugContext(ctx, "latest cache hit",
 		"n", n,
 		"latest", nh.Num,
 		"nreads", nh.nreads,
@@ -246,7 +298,7 @@ func (c *Client) wsListen(ctx context.Context) {
 			c.lcache.error(fmt.Errorf("ws read %q: %w", c.wsurl, err))
 			return
 		}
-		slog.Debug("websocket newHeads",
+		slog.DebugContext(ctx, "websocket newHeads",
 			"n", res.P.R.Num,
 			"h", fmt.Sprintf("%.4x", res.P.R.Hash),
 		)
@@ -254,14 +306,14 @@ func (c *Client) wsListen(ctx context.Context) {
 	}
 }
 
-func (c *Client) httpPoll(ctx context.Context) {
+func (c *Client) httpPoll(ctx context.Context, url string) {
 	var (
 		ticker = time.NewTicker(c.pollDuration)
 		hresp  = headerResp{}
 	)
 	defer ticker.Stop()
 	for range ticker.C {
-		err := c.do(ctx, &hresp, request{
+		err := c.do(ctx, url, &hresp, request{
 			ID:      "1",
 			Version: "2.0",
 			Method:  "eth_getBlockByNumber",
@@ -276,7 +328,7 @@ func (c *Client) httpPoll(ctx context.Context) {
 			c.lcache.error(fmt.Errorf("rpc=%s %w", tag, hresp.Error))
 			return
 		}
-		slog.Debug("http poll",
+		slog.DebugContext(ctx, "http poll",
 			"n", hresp.Number,
 			"h", fmt.Sprintf("%.4x", hresp.Hash),
 		)
@@ -293,24 +345,24 @@ func (c *Client) httpPoll(ctx context.Context) {
 // When n is 0, Latest always fetches the latest block
 // rather than using the cached value,
 // bypassing the caching mechanism.
-func (c *Client) Latest(ctx context.Context, n uint64) (uint64, []byte, error) {
+func (c *Client) Latest(ctx context.Context, url string, n uint64) (uint64, []byte, error) {
 	c.lcache.once.Do(func() {
 		switch {
 		case len(c.wsurl) > 0:
-			slog.Debug("jrpc2 ws listening")
+			slog.DebugContext(ctx, "jrpc2 ws listening")
 			go c.wsListen(context.Background())
 		default:
-			slog.Debug("jrpc2 http polling")
-			go c.httpPoll(context.Background())
+			slog.DebugContext(ctx, "jrpc2 http polling")
+			go c.httpPoll(context.Background(), url)
 		}
 	})
-	if n, h, ok := c.lcache.get(n); ok {
+	if n, h, ok := c.lcache.get(ctx, n); ok {
 		return n, h, nil
 	}
 
 	hresp := headerResp{}
-	err := c.do(ctx, &hresp, request{
-		ID:      "1",
+	err := c.do(ctx, url, &hresp, request{
+		ID:      fmt.Sprintf("latest-%d-%x", n, randbytes()),
 		Version: "2.0",
 		Method:  "eth_getBlockByNumber",
 		Params:  []any{"latest", false},
@@ -322,7 +374,7 @@ func (c *Client) Latest(ctx context.Context, n uint64) (uint64, []byte, error) {
 		const tag = "eth_getBlockByNumber/latest"
 		return 0, nil, fmt.Errorf("rpc=%s %w", tag, hresp.Error)
 	}
-	slog.Debug("http get latest",
+	slog.DebugContext(ctx, "http-get-latest",
 		"n", hresp.Number,
 		"h", fmt.Sprintf("%.4x", hresp.Hash),
 	)
@@ -330,10 +382,10 @@ func (c *Client) Latest(ctx context.Context, n uint64) (uint64, []byte, error) {
 	return uint64(hresp.Number), hresp.Hash, nil
 }
 
-func (c *Client) Hash(ctx context.Context, n uint64) ([]byte, error) {
+func (c *Client) Hash(ctx context.Context, url string, n uint64) ([]byte, error) {
 	hresp := headerResp{}
-	err := c.do(ctx, &hresp, request{
-		ID:      "1",
+	err := c.do(ctx, url, &hresp, request{
+		ID:      fmt.Sprintf("hash-%d-%x", n, randbytes()),
 		Version: "2.0",
 		Method:  "eth_getBlockByNumber",
 		Params:  []any{"0x" + strconv.FormatUint(n, 16), true},
@@ -352,29 +404,36 @@ type key struct {
 	a, b uint64
 }
 
-type (
-	blockmap map[uint64]*eth.Block
-)
+type blockmap map[uint64]*eth.Block
 
 func (c *Client) Get(
 	ctx context.Context,
+	url string,
 	filter *glf.Filter,
 	start, limit uint64,
 ) ([]eth.Block, error) {
+	t0 := time.Now()
+	defer func() {
+		slog.DebugContext(ctx,
+			"jrpc2-get",
+			"filter", filter,
+			"elapsed", time.Since(t0),
+		)
+	}()
 	var (
 		blocks []eth.Block
 		err    error
 	)
 	switch {
 	case filter.UseBlocks:
-		blocks, err = c.bcache.get(c.nocache, ctx, start, limit, c.blocks)
+		blocks, err = c.bcache.get(c.nocache, ctx, url, start, limit, c.blocks)
 		if err != nil {
 			return nil, fmt.Errorf("getting blocks: %w", err)
 		}
 	case filter.UseHeaders:
-		blocks, err = c.hcache.get(c.nocache, ctx, start, limit, c.headers)
+		blocks, err = c.hcache.get(c.nocache, ctx, url, start, limit, c.headers)
 		if err != nil {
-			return nil, fmt.Errorf("getting blocks: %w", err)
+			return nil, fmt.Errorf("getting headers: %w", err)
 		}
 	default:
 		for i := uint64(0); i < limit; i++ {
@@ -393,15 +452,19 @@ func (c *Client) Get(
 
 	switch {
 	case filter.UseReceipts:
-		if err := c.receipts(ctx, bm, start, limit); err != nil {
+		if err := c.receipts(ctx, url, bm, start, limit); err != nil {
 			return nil, fmt.Errorf("getting receipts: %w", err)
 		}
 	case filter.UseLogs:
-		if err := c.logs(ctx, filter, bm, start, limit); err != nil {
+		if err := c.logs(ctx, url, filter, bm, start, limit); err != nil {
 			return nil, fmt.Errorf("getting logs: %w", err)
 		}
+	case filter.UseTraces:
+		if err := c.traces(ctx, url, bm, start, limit); err != nil {
+			return nil, fmt.Errorf("getting traces: %w", err)
+		}
 	}
-	return blocks, validate("Get", start, limit, blocks)
+	return blocks, nil
 }
 
 type blockResp struct {
@@ -411,18 +474,30 @@ type blockResp struct {
 
 type segment struct {
 	sync.Mutex
-	done bool
-	d    []eth.Block
+	nreads int
+	done   bool
+	d      []eth.Block
 }
 
 type cache struct {
 	sync.Mutex
+	maxreads int
 	segments map[key]*segment
 }
 
-type getter func(ctx context.Context, start, limit uint64) ([]eth.Block, error)
+type getter func(ctx context.Context, url string, start, limit uint64) ([]eth.Block, error)
 
-func (c *cache) prune() {
+func (c *cache) pruneMaxRead() {
+	for k, v := range c.segments {
+		v.Lock()
+		if v.nreads >= c.maxreads {
+			delete(c.segments, k)
+		}
+		v.Unlock()
+	}
+}
+
+func (c *cache) pruneSegments() {
 	const size = 5
 	if len(c.segments) <= size {
 		return
@@ -439,29 +514,31 @@ func (c *cache) prune() {
 	}
 }
 
-func (c *cache) get(nocache bool, ctx context.Context, start, limit uint64, f getter) ([]eth.Block, error) {
+func (c *cache) get(nocache bool, ctx context.Context, url string, start, limit uint64, f getter) ([]eth.Block, error) {
 	if nocache {
-		return f(ctx, start, limit)
+		return f(ctx, url, start, limit)
 	}
 	c.Lock()
 	if c.segments == nil {
 		c.segments = make(map[key]*segment)
 	}
+	c.pruneMaxRead()
 	seg, ok := c.segments[key{start, limit}]
 	if !ok {
 		seg = &segment{}
 		c.segments[key{start, limit}] = seg
 	}
-	c.prune()
+	c.pruneSegments()
 	c.Unlock()
 
 	seg.Lock()
 	defer seg.Unlock()
+	seg.nreads++
 	if seg.done {
 		return seg.d, nil
 	}
 
-	blocks, err := f(ctx, start, limit)
+	blocks, err := f(ctx, url, start, limit)
 	if err != nil {
 		return nil, fmt.Errorf("cache get: %w", err)
 	}
@@ -471,22 +548,23 @@ func (c *cache) get(nocache bool, ctx context.Context, start, limit uint64, f ge
 	return seg.d, nil
 }
 
-func (c *Client) blocks(ctx context.Context, start, limit uint64) ([]eth.Block, error) {
+func (c *Client) blocks(ctx context.Context, url string, start, limit uint64) ([]eth.Block, error) {
 	var (
+		t0     = time.Now()
 		reqs   = make([]request, limit)
 		resps  = make([]blockResp, limit)
 		blocks = make([]eth.Block, limit)
 	)
 	for i := uint64(0); i < limit; i++ {
 		reqs[i] = request{
-			ID:      "1",
+			ID:      fmt.Sprintf("blocks-%d-%d-%x", start, limit, randbytes()),
 			Version: "2.0",
 			Method:  "eth_getBlockByNumber",
 			Params:  []any{eth.EncodeUint64(start + i), true},
 		}
 		resps[i].Block = &blocks[i]
 	}
-	err := c.do(ctx, &resps, reqs)
+	err := c.do(ctx, url, &resps, reqs)
 	if err != nil {
 		return nil, fmt.Errorf("requesting blocks: %w", err)
 	}
@@ -496,6 +574,7 @@ func (c *Client) blocks(ctx context.Context, start, limit uint64) ([]eth.Block, 
 			return nil, fmt.Errorf("rpc=%s %w", tag, resps[i].Error)
 		}
 	}
+	slog.DebugContext(ctx, "http-get-blocks", "elapsed", time.Since(t0))
 	return blocks, validate("blocks", start, limit, blocks)
 }
 
@@ -503,22 +582,14 @@ func validate(caller string, start, limit uint64, blocks []eth.Block) error {
 	if len(blocks) == 0 {
 		return fmt.Errorf("%s: no blocks", caller)
 	}
-
-	first, last := blocks[0], blocks[len(blocks)-1]
-	if uint64(first.Num()) != start {
+	first, last := blocks[0].Num(), blocks[len(blocks)-1].Num()
+	if uint64(first) != start {
 		const tag = "%s: rpc response contains invalid data. requested first: %d got: %d"
-		return fmt.Errorf(tag, caller, start, first.Num())
+		return fmt.Errorf(tag, caller, start, first)
 	}
-	if uint64(last.Num()) != start+limit-1 {
+	if uint64(last) != start+limit-1 {
 		const tag = "%s: rpc response contains invalid data. requested last: %d got: %d"
-		return fmt.Errorf(tag, caller, start+limit-1, last.Num())
-	}
-
-	// some rpc responses will not return a parent hash
-	// so there is nothing we can do to validate the hash
-	// chain
-	if len(blocks) <= 1 || len(blocks[0].Header.Parent) < 32 {
-		return nil
+		return fmt.Errorf(tag, caller, start+limit-1, last)
 	}
 	for i := 1; i < len(blocks); i++ {
 		prev, curr := blocks[i-1], blocks[i]
@@ -541,7 +612,7 @@ type headerResp struct {
 	*eth.Header `json:"result"`
 }
 
-func (c *Client) headers(ctx context.Context, start, limit uint64) ([]eth.Block, error) {
+func (c *Client) headers(ctx context.Context, url string, start, limit uint64) ([]eth.Block, error) {
 	var (
 		t0     = time.Now()
 		reqs   = make([]request, limit)
@@ -550,14 +621,14 @@ func (c *Client) headers(ctx context.Context, start, limit uint64) ([]eth.Block,
 	)
 	for i := uint64(0); i < limit; i++ {
 		reqs[i] = request{
-			ID:      "1",
+			ID:      fmt.Sprintf("headers-%d-%d-%x", start, limit, randbytes()),
 			Version: "2.0",
 			Method:  "eth_getBlockByNumber",
 			Params:  []any{eth.EncodeUint64(start + i), false},
 		}
 		resps[i].Header = &blocks[i].Header
 	}
-	err := c.do(ctx, &resps, reqs)
+	err := c.do(ctx, url, &resps, reqs)
 	if err != nil {
 		return nil, fmt.Errorf("requesting headers: %w", err)
 	}
@@ -567,25 +638,23 @@ func (c *Client) headers(ctx context.Context, start, limit uint64) ([]eth.Block,
 			return nil, fmt.Errorf("rpc=%s %w", tag, resps[i].Error)
 		}
 	}
-	slog.Debug("http get headers",
-		"start", start,
-		"limit", limit,
-		"latency", time.Since(t0),
-	)
+	slog.DebugContext(ctx, "http-get-headers", "elapsed", time.Since(t0))
 	return blocks, validate("headers", start, limit, blocks)
 }
 
 type receiptResult struct {
-	BlockHash eth.Bytes  `json:"blockHash"`
-	BlockNum  eth.Uint64 `json:"blockNumber"`
-	TxHash    eth.Bytes  `json:"transactionHash"`
-	TxIdx     eth.Uint64 `json:"transactionIndex"`
-	TxType    eth.Byte   `json:"type"`
-	TxFrom    eth.Bytes  `json:"from"`
-	TxTo      eth.Bytes  `json:"to"`
-	Status    eth.Byte   `json:"status"`
-	GasUsed   eth.Uint64 `json:"gasUsed"`
-	Logs      eth.Logs   `json:"logs"`
+	BlockHash         eth.Bytes   `json:"blockHash"`
+	BlockNum          eth.Uint64  `json:"blockNumber"`
+	TxHash            eth.Bytes   `json:"transactionHash"`
+	TxIdx             eth.Uint64  `json:"transactionIndex"`
+	TxType            eth.Byte    `json:"type"`
+	TxFrom            eth.Bytes   `json:"from"`
+	TxTo              eth.Bytes   `json:"to"`
+	Status            eth.Byte    `json:"status"`
+	GasUsed           eth.Uint64  `json:"gasUsed"`
+	EffectiveGasPrice uint256.Int `json:"effectiveGasPrice"`
+	Logs              eth.Logs    `json:"logs"`
+	ContractAddress   eth.Bytes   `json:"contractAddress"`
 }
 
 type receiptResp struct {
@@ -593,48 +662,85 @@ type receiptResp struct {
 	Result []receiptResult `json:"result"`
 }
 
-func (c *Client) receipts(ctx context.Context, bm blockmap, start, limit uint64) error {
+func (c *Client) receipts(ctx context.Context, url string, bm blockmap, start, limit uint64) error {
+	// First get block headers to ensure we have hashes for all blocks
 	var (
-		reqs  = make([]request, limit)
-		resps = make([]receiptResp, limit)
+		headerReqs  = make([]request, limit)
+		headerResps = make([]headerResp, limit)
 	)
 	for i := uint64(0); i < limit; i++ {
-		reqs[i] = request{
-			ID:      "1",
+		headerReqs[i] = request{
+			ID:      fmt.Sprintf("header-%d-%d-%x", start, limit, randbytes()),
+			Version: "2.0",
+			Method:  "eth_getBlockByNumber",
+			Params:  []any{eth.EncodeUint64(start + i), false},
+		}
+	}
+	err := c.do(ctx, url, &headerResps, headerReqs)
+	if err != nil {
+		return fmt.Errorf("requesting headers: %w", err)
+	}
+	for i := range headerResps {
+		if headerResps[i].Error.Exists() {
+			const tag = "eth_getBlockByNumber"
+			return fmt.Errorf("rpc=%s %w", tag, headerResps[i].Error)
+		}
+		blockNum := start + uint64(i)
+		b, ok := bm[blockNum]
+		if !ok {
+			return fmt.Errorf("block not found for number %d", blockNum)
+		}
+		// Initialize block hash from header
+		b.Header.Hash.Write(headerResps[i].Hash)
+	}
+
+	// Then get receipts
+	var (
+		receiptReqs  = make([]request, limit)
+		receiptResps = make([]receiptResp, limit)
+	)
+	for i := uint64(0); i < limit; i++ {
+		receiptReqs[i] = request{
+			ID:      fmt.Sprintf("receipts-%d-%d-%x", start, limit, randbytes()),
 			Version: "2.0",
 			Method:  "eth_getBlockReceipts",
 			Params:  []any{eth.EncodeUint64(start + i)},
 		}
 	}
-	err := c.do(ctx, &resps, reqs)
+	err = c.do(ctx, url, &receiptResps, receiptReqs)
 	if err != nil {
 		return fmt.Errorf("requesting receipts: %w", err)
 	}
-	for i := range resps {
-		if resps[i].Error.Exists() {
+	for i := range receiptResps {
+		if receiptResps[i].Error.Exists() {
 			const tag = "eth_getBlockReceipts"
-			return fmt.Errorf("rpc=%s %w", tag, resps[i].Error)
+			return fmt.Errorf("rpc=%s %w", tag, receiptResps[i].Error)
 		}
 	}
-	for i := range resps {
-		if len(resps[i].Result) == 0 {
-			return fmt.Errorf("no rpc error but empty result")
+
+	// Process receipts if they exist
+	for i := range receiptResps {
+		blockNum := start + uint64(i)
+		b := bm[blockNum] // We know this exists from header check above
+
+		if len(receiptResps[i].Result) == 0 {
+			slog.DebugContext(ctx, "block has no transactions", "number", blockNum, "URL: ", url)
+			continue
 		}
-		b, ok := bm[uint64(resps[i].Result[0].BlockNum)]
-		if !ok {
-			return fmt.Errorf("block not found")
-		}
-		b.Header.Hash.Write(resps[i].Result[0].BlockHash)
-		for j := range resps[i].Result {
-			tx := b.Tx(uint64(resps[i].Result[j].TxIdx))
-			tx.PrecompHash.Write(resps[i].Result[j].TxHash)
-			tx.Type.Write(byte(resps[i].Result[j].TxType))
-			tx.From.Write(resps[i].Result[j].TxFrom)
-			tx.To.Write(resps[i].Result[j].TxTo)
-			tx.Status.Write(byte(resps[i].Result[j].Status))
-			tx.GasUsed = resps[i].Result[j].GasUsed
-			tx.Logs = make([]eth.Log, len(resps[i].Result[j].Logs))
-			copy(tx.Logs, resps[i].Result[j].Logs)
+
+		// Process receipts
+		for j := range receiptResps[i].Result {
+			tx := b.Tx(uint64(receiptResps[i].Result[j].TxIdx))
+			tx.PrecompHash.Write(receiptResps[i].Result[j].TxHash)
+			tx.Type.Write(byte(receiptResps[i].Result[j].TxType))
+			tx.From.Write(receiptResps[i].Result[j].TxFrom)
+			tx.To.Write(receiptResps[i].Result[j].TxTo)
+			tx.Status.Write(byte(receiptResps[i].Result[j].Status))
+			tx.GasUsed = receiptResps[i].Result[j].GasUsed
+			tx.EffectiveGasPrice = receiptResps[i].Result[j].EffectiveGasPrice
+			tx.Logs = make([]eth.Log, len(receiptResps[i].Result[j].Logs))
+			tx.ContractAddress.Write(receiptResps[i].Result[j].ContractAddress)
+			copy(tx.Logs, receiptResps[i].Result[j].Logs)
 		}
 	}
 	return nil
@@ -654,37 +760,67 @@ type logResp struct {
 	Result []logResult `json:"result"`
 }
 
-func (c *Client) logs(ctx context.Context, filter *glf.Filter, bm blockmap, start, limit uint64) error {
+func (c *Client) logs(ctx context.Context, url string, filter *glf.Filter, bm blockmap, start, limit uint64) error {
 	var (
-		t0 = time.Now()
-		lf = struct {
+		t0        = time.Now()
+		fromBlock = start
+		toBlock   = start + limit - 1
+		lf        = struct {
 			From    string     `json:"fromBlock"`
 			To      string     `json:"toBlock"`
 			Address []string   `json:"address"`
 			Topics  [][]string `json:"topics"`
 		}{
-			From:    eth.EncodeUint64(start),
-			To:      eth.EncodeUint64(start + limit - 1),
+			From:    eth.EncodeUint64(fromBlock),
+			To:      eth.EncodeUint64(toBlock),
 			Address: filter.Addresses(),
 			Topics:  filter.Topics(),
 		}
-		lresp = logResp{}
+		resp = []any{
+			&headerResp{},
+			&logResp{},
+		}
 	)
-	err := c.do(ctx, &lresp, request{
-		ID:      "1",
-		Version: "2.0",
-		Method:  "eth_getLogs",
-		Params:  []any{lf},
+	err := c.do(ctx, url, &resp, []request{
+		request{
+			ID:      fmt.Sprintf("blocks-%d-%d-%x", start, limit, randbytes()),
+			Version: "2.0",
+			Method:  "eth_getBlockByNumber",
+			Params:  []any{lf.To, false},
+		},
+		request{
+			ID:      fmt.Sprintf("logs-%d-%d-%x", start, limit, randbytes()),
+			Version: "2.0",
+			Method:  "eth_getLogs",
+			Params:  []any{lf},
+		},
 	})
 	if err != nil {
 		return fmt.Errorf("making logs request: %w", err)
 	}
-	if lresp.Error.Exists() {
-		return fmt.Errorf("rpc=%s %w", "eth_getLogs", lresp.Error)
+	var (
+		hresp = resp[0].(*headerResp)
+		lresp = resp[1].(*logResp)
+	)
+	switch {
+	case hresp.Error.Exists():
+		return fmt.Errorf("rpc=eth_getLogs/eth_getBlockByNumber %w", lresp.Error)
+	case lresp.Error.Exists():
+		return fmt.Errorf("rpc=eth_getLogs %w", lresp.Error)
+	case hresp.Header == nil:
+		return fmt.Errorf("eth backend missing logs for block: %d", toBlock)
 	}
 	var logsByTx = map[key][]logResult{}
 	for i := range lresp.Result {
-		k := key{uint64(lresp.Result[i].BlockNum), uint64(lresp.Result[i].TxIdx)}
+		var (
+			blockNum = uint64(lresp.Result[i].BlockNum)
+			txIdx    = uint64(lresp.Result[i].TxIdx)
+			k        = key{blockNum, txIdx}
+		)
+		if blockNum < start || blockNum >= start+limit {
+			const tag = "eth_getLogs out of range block. num=%d start=%d lim=%d"
+			return fmt.Errorf(tag, blockNum, start, limit)
+		}
 		if logs, ok := logsByTx[k]; ok {
 			logsByTx[k] = append(logs, lresp.Result[i])
 			continue
@@ -697,17 +833,82 @@ func (c *Client) logs(ctx context.Context, filter *glf.Filter, bm blockmap, star
 		if !ok {
 			return fmt.Errorf("block not found")
 		}
+		b.Lock()
 		b.Header.Hash.Write(logs[0].BlockHash)
 		tx := b.Tx(k.b)
 		tx.PrecompHash.Write(logs[0].TxHash)
 		for i := range logs {
 			tx.Logs.Add(logs[i].Log)
 		}
+		b.Unlock()
 	}
-	slog.Debug("http get logs",
-		"start", start,
-		"limit", limit,
-		"latency", time.Since(t0),
+	slog.DebugContext(ctx, "http-get-logs",
+		"nlogs", len(lresp.Result),
+		"elapsed", time.Since(t0),
 	)
+	return nil
+}
+
+type traceBlockResult struct {
+	BlockHash eth.Bytes       `json:"blockHash"`
+	BlockNum  uint64          `json:"blockNumber"`
+	TxHash    eth.Bytes       `json:"transactionHash"`
+	TxIdx     uint64          `json:"transactionPosition"`
+	Action    eth.TraceAction `json:"action"`
+}
+
+type traceBlockResp struct {
+	Error  `json:"error"`
+	Result []traceBlockResult `json:"result"`
+}
+
+func (c *Client) traces(ctx context.Context, url string, bm blockmap, start, limit uint64) error {
+	t0 := time.Now()
+	for i := uint64(0); i < limit; i++ {
+		res := traceBlockResp{}
+		req := request{
+			ID:      fmt.Sprintf("traces-%d-%d-%x", start, limit, randbytes()),
+			Version: "2.0",
+			Method:  "trace_block",
+			Params:  []any{eth.EncodeUint64(start + i)},
+		}
+		err := c.do(ctx, url, &res, req)
+		if err != nil {
+			return fmt.Errorf("requesting traces: %w", err)
+		}
+		if res.Error.Exists() {
+			const tag = "trace_block"
+			return fmt.Errorf("rpc=%s %w", tag, res.Error)
+		}
+		if len(res.Result) == 0 {
+			return fmt.Errorf("no rpc error but empty result")
+		}
+		block, ok := bm[res.Result[0].BlockNum]
+		if !ok {
+			return fmt.Errorf("missing block in block map")
+		}
+		block.Header.Hash.Write(res.Result[0].BlockHash)
+
+		var tracesByTx = map[key][]traceBlockResult{}
+		for i := range res.Result {
+			k := key{block.Num(), uint64(res.Result[i].TxIdx)}
+			if traces, ok := tracesByTx[k]; ok {
+				tracesByTx[k] = append(traces, res.Result[i])
+				continue
+			}
+			tracesByTx[k] = []traceBlockResult{res.Result[i]}
+		}
+		for k, traces := range tracesByTx {
+			tx := block.Tx(k.b)
+			tx.PrecompHash.Write(traces[0].TxHash)
+			tx.TraceActions = make([]eth.TraceAction, len(traces))
+			for i := range traces {
+				ta := traces[i].Action
+				ta.Idx = uint64(i)
+				tx.TraceActions[i] = ta
+			}
+		}
+	}
+	slog.DebugContext(ctx, "http-get-traces", "elapsed", time.Since(t0))
 	return nil
 }

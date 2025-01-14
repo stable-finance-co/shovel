@@ -10,6 +10,7 @@ test("makeConfig", () => {
       { name: "to", type: "bytea" },
       { name: "value", type: "numeric" },
     ],
+    index: [["from desc"]],
   };
   const mainnet: Source = {
     name: "mainnet",
@@ -23,6 +24,7 @@ test("makeConfig", () => {
       sources: [{ name: mainnet.name, start: 0n }],
       table: transfersTable,
       block: [],
+	  notification: {columns: ["from", "to", "value"]},
       event: {
         type: "event",
         name: "Transfer",
@@ -59,6 +61,7 @@ test("makeConfig", () => {
         ],
         table: {
           name: "transfers",
+          index: [["from desc"]],
           columns: [
             {
               name: "from",
@@ -74,6 +77,7 @@ test("makeConfig", () => {
             },
           ],
         },
+		notification: {columns: ["from", "to", "value"]},
         block: [],
         event: {
           type: "event",
